@@ -147,6 +147,61 @@ defmodule Broker.Protocol.Codec do
   end
 
   # ---------------------------------------------------------------------------
+  # SUBSCRIBE (0x0B) / SUBSCRIBE_ACK (0x0C)
+  # ---------------------------------------------------------------------------
+
+  @spec decode_subscribe(binary()) :: {:ok, map()} | {:error, atom()}
+  def decode_subscribe(<<
+        topic_len::16,
+        topic::binary-size(topic_len),
+        partition::32,
+        start_offset::64,
+        max_in_flight::32,
+        sub_id::64
+      >>) do
+    {:ok,
+     %{
+       topic: topic,
+       partition: partition,
+       start_offset: start_offset,
+       max_in_flight: max_in_flight,
+       sub_id: sub_id
+     }}
+  end
+
+  def decode_subscribe(_), do: {:error, :invalid_subscribe}
+
+  @spec encode_subscribe_ack(integer(), byte()) :: binary()
+  def encode_subscribe_ack(sub_id, error_code) do
+    encode_frame(Frame.subscribe_ack(), <<sub_id::64, error_code>>)
+  end
+
+  # ---------------------------------------------------------------------------
+  # UNSUBSCRIBE (0x0D)
+  # ---------------------------------------------------------------------------
+
+  @spec decode_unsubscribe(binary()) :: {:ok, map()} | {:error, atom()}
+  def decode_unsubscribe(<<sub_id::64>>) do
+    {:ok, %{sub_id: sub_id}}
+  end
+
+  def decode_unsubscribe(_), do: {:error, :invalid_unsubscribe}
+
+  # ---------------------------------------------------------------------------
+  # RECORD_PUSH (0x0E)  — broker → client streaming record
+  # ---------------------------------------------------------------------------
+
+  @spec encode_record_push(integer(), map()) :: binary()
+  def encode_record_push(sub_id, record) do
+    payload =
+      <<sub_id::64, record.offset::64, record.timestamp::64,
+        byte_size(record.key)::32, record.key::binary,
+        byte_size(record.value)::32, record.value::binary>>
+
+    encode_frame(Frame.record_push(), payload)
+  end
+
+  # ---------------------------------------------------------------------------
   # ERROR (0xFF)
   # ---------------------------------------------------------------------------
 

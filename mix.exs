@@ -23,6 +23,8 @@ defmodule Broker.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
-    []
+    [
+      {:gen_stage, "~> 1.2"}
+    ]
   end
 end

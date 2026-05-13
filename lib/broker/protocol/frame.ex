@@ -14,6 +14,8 @@ defmodule Broker.Protocol.Frame do
   @commit_offset 0x05
   @join_group 0x07
   @heartbeat 0x09
+  @subscribe 0x0B
+  @unsubscribe 0x0D
 
   # Broker → Client
   @produce_ack 0x02
@@ -21,6 +23,8 @@ defmodule Broker.Protocol.Frame do
   @commit_ack 0x06
   @join_ack 0x08
   @heartbeat_ack 0x0A
+  @subscribe_ack 0x0C
+  @record_push 0x0E
   @error 0xFF
 
   def produce, do: @produce
@@ -28,11 +32,15 @@ defmodule Broker.Protocol.Frame do
   def commit_offset, do: @commit_offset
   def join_group, do: @join_group
   def heartbeat, do: @heartbeat
+  def subscribe, do: @subscribe
+  def unsubscribe, do: @unsubscribe
   def produce_ack, do: @produce_ack
   def fetch_response, do: @fetch_response
   def commit_ack, do: @commit_ack
   def join_ack, do: @join_ack
   def heartbeat_ack, do: @heartbeat_ack
+  def subscribe_ack, do: @subscribe_ack
+  def record_push, do: @record_push
   def error, do: @error
 
   # Error codes

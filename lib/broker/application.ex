@@ -6,7 +6,9 @@ defmodule Broker.Application do
   def start(_type, _args) do
     children = [
       {Registry, keys: :unique, name: Broker.Registry},
+      {Registry, keys: :duplicate, name: Broker.ProducerRegistry},
       Broker.Topic.TopicSupervisor,
+      Broker.Stage.SubscriptionSupervisor,
       {DynamicSupervisor, name: Broker.ConnectionSupervisor, strategy: :one_for_one},
       {Broker.Network.Listener, port: Application.get_env(:broker, :port, 9092)}
     ]

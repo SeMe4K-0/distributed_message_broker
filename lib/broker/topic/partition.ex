@@ -43,7 +43,9 @@ defmodule Broker.Topic.Partition do
 
   @impl GenServer
   def handle_call({:append, key, value}, _from, state) do
-    {:reply, SegmentManager.append(manager(state), key, value), state}
+    result = SegmentManager.append(manager(state), key, value)
+    if match?({:ok, _}, result), do: Broker.Stage.PartitionProducer.notify(state.topic, state.partition)
+    {:reply, result, state}
   end
 
   @impl GenServer

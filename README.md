@@ -8,16 +8,20 @@ Kafka-подобный брокер сообщений, написанный с 
 
 ```
 Broker.Application (one_for_one)
-├── Registry (unique)                   — именование партиций
+├── Registry (unique)                   — именование партиций и менеджеров
+├── ProducerRegistry (duplicate)        — регистрация GenStage-продюсеров
 ├── Topic.TopicSupervisor               — DynamicSupervisor топиков
 │     └── Topic.PartitionSupervisor     — one_for_one на партицию
 │           └── Topic.Partition         — GenServer, сериализует записи
+├── Stage.SubscriptionSupervisor        — DynamicSupervisor подписок
+│     ├── Stage.PartitionProducer       — GenStage :producer (один на подписку)
+│     └── Stage.Subscriber             — GenStage :consumer (один на подписку)
 ├── Network.Listener                    — TCP accept loop
 └── ConnectionSupervisor                — DynamicSupervisor соединений
       └── Network.Connection            — GenServer на клиента
 ```
 
-## Текущий статус: Фаза 2
+## Текущий статус: Фаза 3
 
 ### Что реализовано
 
@@ -104,6 +108,51 @@ GenServer, удаляющий `.log` и `.index` файлы старше `retent
 
 ---
 
+#### Фаза 3 — GenStage: backpressure, demand-driven flow
+
+**Потоковые подписки** (`lib/broker/stage/`)
+
+Вместо poll-based FETCH клиент может оформить подписку через команду `SUBSCRIBE`. Брокер будет сам толкать записи по мере появления, соблюдая лимит `max_in_flight` (backpressure через GenStage demand).
+
+**Новые типы сообщений:**
+
+| Код    | Тип             | Направление      |
+|--------|-----------------|------------------|
+| `0x0B` | SUBSCRIBE       | client → broker  |
+| `0x0C` | SUBSCRIBE_ACK   | broker → client  |
+| `0x0D` | UNSUBSCRIBE     | client → broker  |
+| `0x0E` | RECORD_PUSH     | broker → client  |
+
+**SUBSCRIBE payload:**
+```
+topic_len::16 | topic | partition::32 | start_offset::64 | max_in_flight::32 | sub_id::64
+```
+
+**RECORD_PUSH payload:**
+```
+sub_id::64 | offset::64 | timestamp::64 | key_len::32 | key | value_len::32 | value
+```
+
+**Как это работает:**
+
+```
+Client                Broker.Connection          PartitionProducer   Subscriber
+  │ SUBSCRIBE ──────────► │                             │               │
+  │                       │── start_subscription ──────►│               │
+  │                       │                             │◄── demand(N) ─┤
+  │                       │                             │── records[] ──►│
+  │ ◄── SUBSCRIBE_ACK ────│                             │               │── RECORD_PUSH ──► Client
+  │                       │                             │               │
+```
+
+1. На каждую подписку создаётся пара `PartitionProducer` + `Subscriber` в `SubscriptionSupervisor`.
+2. `PartitionProducer` читает из сегментного лога, когда `Subscriber` сигнализирует demand.
+3. `Partition.append` уведомляет все `PartitionProducer` через `ProducerRegistry` (duplicate) — они немедленно просыпаются и отправляют накопившийся demand вместо ожидания poll-таймера (100 мс).
+4. При достижении хвоста лога продюсер ждёт `:new_records` или poll, не блокируя остальных.
+5. Все подписки закрываются при разрыве TCP-соединения.
+
+---
+
 ### Файловая структура
 
 ```
@@ -118,11 +167,15 @@ lib/broker/
 │   ├── segment_index.ex        — чистые функции: binary search
 │   ├── segment_manager.ex      — GenServer: список сегментов партиции
 │   └── compactor.ex            — GenServer: удаление старых сегментов
+├── stage/
+│   ├── partition_producer.ex   — GenStage :producer, читает лог по demand
+│   ├── subscriber.ex           — GenStage :consumer, шлёт RECORD_PUSH клиенту
+│   └── subscription_supervisor.ex — DynamicSupervisor пар producer+subscriber
 ├── network/
 │   ├── listener.ex             — TCP accept loop
 │   └── connection.ex           — обработка одного TCP-клиента
 └── topic/
-    ├── partition.ex            — GenServer: делегирует в SegmentManager
+    ├── partition.ex            — GenServer: делегирует в SegmentManager + notify
     ├── partition_supervisor.ex — запускает SegmentManager + Compactor + Partition
     └── topic_supervisor.ex     — DynamicSupervisor
 ```
@@ -145,7 +198,7 @@ test/
 ```
 
 ```
-mix test   # 44 теста, 0 ошибок
+mix test   # 52 теста, 0 ошибок
 ```
 
 ## Запуск
@@ -201,13 +254,44 @@ frame2 = <<0x42, 0x01, 0x03, 0x00, byte_size(fetch_payload)::32, fetch_payload::
 {:ok, response} = :gen_tcp.recv(socket, 0, 5000)
 ```
 
+## Пример — потоковая подписка (SUBSCRIBE / RECORD_PUSH)
+
+```elixir
+# Подключение
+{:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", 9092, [:binary, packet: :raw, active: false])
+
+topic = "events"
+
+# SUBSCRIBE: подписаться на топик с offset=0, max_in_flight=10, sub_id=1
+sub_payload =
+  <<byte_size(topic)::16, topic::binary,
+    0::32,   # partition
+    0::64,   # start_offset
+    10::32,  # max_in_flight
+    1::64>>  # sub_id
+
+frame = <<0x42, 0x01, 0x0B, 0x00, byte_size(sub_payload)::32, sub_payload::binary>>
+:gen_tcp.send(socket, frame)
+
+# Получаем SUBSCRIBE_ACK (0x0C): sub_id::64, error_code::8
+{:ok, ack} = :gen_tcp.recv(socket, 0, 5000)
+
+# С этого момента брокер сам пушит RECORD_PUSH (0x0E) при появлении записей.
+# Читаем один кадр:
+{:ok, push} = :gen_tcp.recv(socket, 0, 5000)
+<<0x42, 0x01, 0x0E, 0x00, len::32, payload::binary-size(len)>> = push
+<<_sub_id::64, offset::64, _ts::64, kl::32, key::binary-size(kl),
+  vl::32, value::binary-size(vl)>> = payload
+IO.puts("offset=#{offset} key=#{key} value=#{value}")
+```
+
 ## Roadmap
 
 | Фаза | Описание | Статус |
 |------|----------|--------|
 | 1 | Одиночный брокер — TCP, WAL, produce/fetch | ✅ Готово |
 | 2 | Сегментный лог + индекс, O(log n) lookup | ✅ Готово |
-| 3 | GenStage — backpressure, demand-driven flow | ⬜ |
+| 3 | GenStage — backpressure, demand-driven flow | ✅ Готово |
 | 4 | Кластер — consistent hashing, партиции по нодам | ⬜ |
 | 5 | Raft — leader election, log replication | ⬜ |
 | 6 | Consumer groups — координатор, rebalance | ⬜ |
