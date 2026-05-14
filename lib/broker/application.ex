@@ -9,6 +9,7 @@ defmodule Broker.Application do
       {Registry, keys: :duplicate, name: Broker.ProducerRegistry},
       Broker.Topic.TopicSupervisor,
       Broker.Stage.SubscriptionSupervisor,
+      Broker.Cluster.Manager,
       {DynamicSupervisor, name: Broker.ConnectionSupervisor, strategy: :one_for_one},
       {Broker.Network.Listener, port: Application.get_env(:broker, :port, 9092)}
     ]

@@ -16,12 +16,13 @@ Broker.Application (one_for_one)
 ├── Stage.SubscriptionSupervisor        — DynamicSupervisor подписок
 │     ├── Stage.PartitionProducer       — GenStage :producer (один на подписку)
 │     └── Stage.Subscriber             — GenStage :consumer (один на подписку)
+├── Cluster.Manager                     — GenServer, consistent hashing ring
 ├── Network.Listener                    — TCP accept loop
 └── ConnectionSupervisor                — DynamicSupervisor соединений
       └── Network.Connection            — GenServer на клиента
 ```
 
-## Текущий статус: Фаза 3
+## Текущий статус: Фаза 4
 
 ### Что реализовано
 
@@ -153,6 +154,54 @@ Client                Broker.Connection          PartitionProducer   Subscriber
 
 ---
 
+#### Фаза 4 — Кластер: consistent hashing, партиции по нодам
+
+**Consistent hashing ring** (`lib/broker/cluster/`)
+
+Каждый (topic, partition) детерминированно маппится на одну ноду кластера. Используются 150 виртуальных нод на физическую ноду (vnode) — это обеспечивает равномерное распределение нагрузки (~±5%) и минимальное перемещение ключей при join/leave.
+
+| Модуль | Роль |
+|--------|------|
+| `Cluster.HashRing` | Чистые функции: `new/add_node/remove_node/node_for` |
+| `Cluster.Manager` | GenServer: следит за топологией через `:net_kernel.monitor_nodes/1` |
+| `Cluster.RPC` | Модуль для `:erpc.call` — `produce/3`, `fetch_with_hwm/4` |
+
+**Как работает маршрутизация:**
+
+```
+Client ──PRODUCE──► Connection (node1)
+                       │
+                       ├─ owner == node()? ─► local append
+                       │
+                       └─ owner == node2? ──► :erpc.call(node2, RPC, :produce, [...])
+                                                 │
+                                                 └─► Partition на node2
+```
+
+При FETCH — то же самое: `RPC.fetch_with_hwm/4` возвращает `{:ok, records, hwm}` за один RPC-вызов.  
+При SUBSCRIBE — `PartitionProducer` стартует на owning-ноде через `SubscriptionSupervisor.start_remote_producer/3`, а локальный `Subscriber` подписывается на него через Erlang distribution (GenStage работает cross-node).
+
+**Конфигурация кластера:**
+
+```elixir
+# config/config.exs
+config :broker, peers: [:"broker2@192.168.1.2", :"broker3@192.168.1.3"]
+```
+
+При старте `Cluster.Manager` коннектится к peers через `Node.connect/1` и добавляет их в кольцо. При `:nodedown` — убирает из кольца.
+
+**Запуск кластера:**
+
+```bash
+# Нода 1
+elixir --name broker1@192.168.1.1 -S mix run --no-halt
+
+# Нода 2 (peers: [:"broker1@192.168.1.1"])
+elixir --name broker2@192.168.1.2 -S mix run --no-halt
+```
+
+---
+
 ### Файловая структура
 
 ```
@@ -161,6 +210,10 @@ lib/broker/
 ├── protocol/
 │   ├── frame.ex                — константы типов и кодов ошибок
 │   └── codec.ex                — encode/decode фреймов и payload
+├── cluster/
+│   ├── hash_ring.ex            — чистые функции: consistent hashing, 150 vnodes
+│   ├── manager.ex              — GenServer: кольцо, nodeup/nodedown
+│   └── rpc.ex                  — функции для :erpc.call (produce/fetch)
 ├── log/
 │   ├── wal.ex                  — чистые функции: encode/decode/append
 │   ├── segment.ex              — GenServer: один .log + .index файл
@@ -170,10 +223,10 @@ lib/broker/
 ├── stage/
 │   ├── partition_producer.ex   — GenStage :producer, читает лог по demand
 │   ├── subscriber.ex           — GenStage :consumer, шлёт RECORD_PUSH клиенту
-│   └── subscription_supervisor.ex — DynamicSupervisor пар producer+subscriber
+│   └── subscription_supervisor.ex — DynamicSupervisor + cross-node routing
 ├── network/
 │   ├── listener.ex             — TCP accept loop
-│   └── connection.ex           — обработка одного TCP-клиента
+│   └── connection.ex           — обработка одного TCP-клиента + routing
 └── topic/
     ├── partition.ex            — GenServer: делегирует в SegmentManager + notify
     ├── partition_supervisor.ex — запускает SegmentManager + Compactor + Partition
@@ -198,7 +251,8 @@ test/
 ```
 
 ```
-mix test   # 52 теста, 0 ошибок
+mix test                       # 68 тестов, 0 ошибок (4 distributed исключены)
+mix test --include distributed # + 4 двухнодовых теста (нужен --name)
 ```
 
 ## Запуск
@@ -292,7 +346,7 @@ IO.puts("offset=#{offset} key=#{key} value=#{value}")
 | 1 | Одиночный брокер — TCP, WAL, produce/fetch | ✅ Готово |
 | 2 | Сегментный лог + индекс, O(log n) lookup | ✅ Готово |
 | 3 | GenStage — backpressure, demand-driven flow | ✅ Готово |
-| 4 | Кластер — consistent hashing, партиции по нодам | ⬜ |
+| 4 | Кластер — consistent hashing, партиции по нодам | ✅ Готово |
 | 5 | Raft — leader election, log replication | ⬜ |
 | 6 | Consumer groups — координатор, rebalance | ⬜ |
 | 7 | Observability — Telemetry, MetricsLib, Benchee | ⬜ |

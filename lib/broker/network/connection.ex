@@ -4,6 +4,7 @@ defmodule Broker.Network.Connection do
 
   require Logger
 
+  alias Broker.Cluster.{Manager, RPC}
   alias Broker.Protocol.{Codec, Frame}
   alias Broker.Stage.SubscriptionSupervisor
   alias Broker.Topic.{Partition, TopicSupervisor}
@@ -49,7 +50,7 @@ defmodule Broker.Network.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Buffer processing — extract complete frames one at a time
+  # Buffer processing
   # ---------------------------------------------------------------------------
 
   defp process_buffer(buffer, responses, state) do
@@ -66,17 +67,31 @@ defmodule Broker.Network.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Frame handlers — return {response_binary | nil, state}
+  # Frame handlers
   # ---------------------------------------------------------------------------
 
-  # PRODUCE (0x01)
+  # PRODUCE (0x01) — route to owning node
   defp handle_frame(0x01, payload, state) do
     response =
       case Codec.decode_produce(payload) do
         {:ok, %{topic: topic, partition: p, correlation_id: cid, records: records}} ->
-          partition_pid = ensure_partition(topic, p)
+          owner = owner_node(topic, p)
 
-          case append_records(partition_pid, records) do
+          result =
+            if owner == node() do
+              pid = ensure_partition(topic, p)
+              append_records(pid, records)
+            else
+              try do
+                :erpc.call(owner, RPC, :produce, [topic, p, records])
+              catch
+                :error, {:erpc, reason} ->
+                  Logger.error("[Connection] RPC produce failed: #{inspect(reason)}")
+                  {:error, :rpc_failed}
+              end
+            end
+
+          case result do
             {:ok, base_offset} -> Codec.encode_produce_ack(cid, base_offset, Frame.err_none())
             {:error, _} -> Codec.encode_error(cid, Frame.err_invalid_request(), "append failed")
           end
@@ -88,19 +103,47 @@ defmodule Broker.Network.Connection do
     {response, state}
   end
 
-  # FETCH (0x03)
+  # FETCH (0x03) — route to owning node
   defp handle_frame(0x03, payload, state) do
     response =
       case Codec.decode_fetch(payload) do
-        {:ok, %{topic: topic, partition: p, offset: offset, max_bytes: max_bytes, correlation_id: cid}} ->
-          case get_partition(topic, p) do
-            nil ->
-              Codec.encode_error(cid, Frame.err_unknown_topic(), "unknown topic/partition")
+        {:ok,
+         %{
+           topic: topic,
+           partition: p,
+           offset: offset,
+           max_bytes: max_bytes,
+           correlation_id: cid
+         }} ->
+          owner = owner_node(topic, p)
 
-            pid ->
-              {:ok, records} = Partition.fetch(pid, offset, max_bytes)
-              hwm = Partition.high_watermark(pid)
+          result =
+            if owner == node() do
+              case get_partition(topic, p) do
+                nil ->
+                  {:error, :unknown}
+
+                pid ->
+                  {:ok, records} = Partition.fetch(pid, offset, max_bytes)
+                  hwm = Partition.high_watermark(pid)
+                  {:ok, records, hwm}
+              end
+            else
+              try do
+                :erpc.call(owner, RPC, :fetch_with_hwm, [topic, p, offset, max_bytes])
+              catch
+                :error, {:erpc, reason} ->
+                  Logger.error("[Connection] RPC fetch failed: #{inspect(reason)}")
+                  {:ok, [], 0}
+              end
+            end
+
+          case result do
+            {:ok, records, hwm} ->
               Codec.encode_fetch_response(cid, hwm, records)
+
+            {:error, :unknown} ->
+              Codec.encode_error(cid, Frame.err_unknown_topic(), "unknown topic/partition")
           end
 
         {:error, _} ->
@@ -121,8 +164,6 @@ defmodule Broker.Network.Connection do
          max_in_flight: max_in_flight,
          sub_id: sub_id
        }} ->
-        _ = ensure_partition(topic, p)
-
         case SubscriptionSupervisor.start_subscription(
                topic, p, start_offset, max_in_flight, sub_id, state.socket
              ) do
@@ -145,7 +186,8 @@ defmodule Broker.Network.Connection do
       {:ok, %{sub_id: sub_id}} ->
         case Map.get(state.subs, sub_id) do
           nil ->
-            {Codec.encode_error(sub_id, Frame.err_invalid_request(), "unknown subscription"), state}
+            {Codec.encode_error(sub_id, Frame.err_invalid_request(), "unknown subscription"),
+             state}
 
           {producer_pid, subscriber_pid} ->
             SubscriptionSupervisor.stop_subscription(producer_pid, subscriber_pid)
@@ -162,7 +204,18 @@ defmodule Broker.Network.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Partition helpers
+  # Routing helpers
+  # ---------------------------------------------------------------------------
+
+  defp owner_node(topic, partition) do
+    case Process.whereis(Manager) do
+      nil -> node()
+      _ -> Manager.node_for(topic, partition)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Partition helpers (local-only)
   # ---------------------------------------------------------------------------
 
   defp ensure_partition(topic, partition) do
@@ -194,8 +247,7 @@ defmodule Broker.Network.Connection do
     end)
     |> case do
       {:ok, last_offset} ->
-        base = last_offset - length(records) + 1
-        {:ok, max(base, 0)}
+        {:ok, max(last_offset - length(records) + 1, 0)}
 
       err ->
         err
