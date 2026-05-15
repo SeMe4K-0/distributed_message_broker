@@ -24,6 +24,16 @@ defmodule Broker.Cluster.Manager do
   @spec nodes() :: [node()]
   def nodes(), do: GenServer.call(__MODULE__, :nodes)
 
+  @doc "Returns the configured replication_factor."
+  @spec replication_factor() :: pos_integer()
+  def replication_factor(), do: GenServer.call(__MODULE__, :replication_factor)
+
+  @doc "Returns up to `replication_factor` replica nodes for the given (topic, partition)."
+  @spec replicas_for(String.t(), non_neg_integer()) :: [node()]
+  def replicas_for(topic, partition) do
+    GenServer.call(__MODULE__, {:replicas_for, {topic, partition}})
+  end
+
   @doc "Explicitly connect to a peer and add it to the ring."
   @spec connect_node(node()) :: :ok | {:error, term()}
   def connect_node(peer) do
@@ -37,6 +47,13 @@ defmodule Broker.Cluster.Manager do
   @impl GenServer
   def init(opts) do
     peers = Keyword.get(opts, :peers, Application.get_env(:broker, :peers, []))
+
+    rf =
+      Keyword.get(
+        opts,
+        :replication_factor,
+        Application.get_env(:broker, :replication_factor, 1)
+      )
 
     if Node.alive?() do
       :net_kernel.monitor_nodes(true)
@@ -53,8 +70,8 @@ defmodule Broker.Cluster.Manager do
         end
       end)
 
-    Logger.info("[ClusterManager] Started. Nodes: #{inspect(HashRing.nodes(ring))}")
-    {:ok, %{ring: ring}}
+    Logger.info("[ClusterManager] Started. Nodes: #{inspect(HashRing.nodes(ring))}, RF=#{rf}")
+    {:ok, %{ring: ring, replication_factor: rf}}
   end
 
   @impl GenServer
@@ -65,6 +82,17 @@ defmodule Broker.Cluster.Manager do
   @impl GenServer
   def handle_call(:nodes, _from, state) do
     {:reply, HashRing.nodes(state.ring), state}
+  end
+
+  @impl GenServer
+  def handle_call(:replication_factor, _from, state) do
+    {:reply, state.replication_factor, state}
+  end
+
+  @impl GenServer
+  def handle_call({:replicas_for, key}, _from, state) do
+    replicas = HashRing.replicas_for(state.ring, key, state.replication_factor)
+    {:reply, replicas, state}
   end
 
   @impl GenServer

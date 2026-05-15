@@ -43,8 +43,18 @@ defmodule Broker.Topic.Partition do
 
   @impl GenServer
   def handle_call({:append, key, value}, _from, state) do
-    result = SegmentManager.append(manager(state), key, value)
-    if match?({:ok, _}, result), do: Broker.Stage.PartitionProducer.notify(state.topic, state.partition)
+    raft = Broker.Raft.Server.name(state.topic, state.partition)
+
+    result =
+      case Broker.Raft.Server.propose(raft, {:append, key, value}) do
+        {:ok, {:ok, offset}} -> {:ok, offset}
+        {:ok, {:error, _} = err} -> err
+        {:error, _} = err -> err
+      end
+
+    if match?({:ok, _}, result),
+      do: Broker.Stage.PartitionProducer.notify(state.topic, state.partition)
+
     {:reply, result, state}
   end
 

@@ -70,26 +70,13 @@ defmodule Broker.Network.Connection do
   # Frame handlers
   # ---------------------------------------------------------------------------
 
-  # PRODUCE (0x01) — route to owning node
+  # PRODUCE (0x01) — route to owning node, retry on not_leader hint from Raft.
   defp handle_frame(0x01, payload, state) do
     response =
       case Codec.decode_produce(payload) do
         {:ok, %{topic: topic, partition: p, correlation_id: cid, records: records}} ->
           owner = owner_node(topic, p)
-
-          result =
-            if owner == node() do
-              pid = ensure_partition(topic, p)
-              append_records(pid, records)
-            else
-              try do
-                :erpc.call(owner, RPC, :produce, [topic, p, records])
-              catch
-                :error, {:erpc, reason} ->
-                  Logger.error("[Connection] RPC produce failed: #{inspect(reason)}")
-                  {:error, :rpc_failed}
-              end
-            end
+          result = produce_routed(owner, topic, p, records)
 
           case result do
             {:ok, base_offset} -> Codec.encode_produce_ack(cid, base_offset, Frame.err_none())
@@ -211,6 +198,32 @@ defmodule Broker.Network.Connection do
     case Process.whereis(Manager) do
       nil -> node()
       _ -> Manager.node_for(topic, partition)
+    end
+  end
+
+  # Try the primary; if it tells us it's not the leader, retry on the indicated leader.
+  defp produce_routed(target, topic, p, records, retried? \\ false) do
+    result =
+      if target == node() do
+        pid = ensure_partition(topic, p)
+        append_records(pid, records)
+      else
+        try do
+          :erpc.call(target, RPC, :produce, [topic, p, records])
+        catch
+          :error, {:erpc, reason} ->
+            Logger.error("[Connection] RPC produce failed: #{inspect(reason)}")
+            {:error, :rpc_failed}
+        end
+      end
+
+    case result do
+      {:error, {:not_leader, leader}}
+      when not retried? and not is_nil(leader) and leader != target ->
+        produce_routed(leader, topic, p, records, true)
+
+      other ->
+        other
     end
   end
 

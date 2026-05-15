@@ -16,13 +16,14 @@ Broker.Application (one_for_one)
 ├── Stage.SubscriptionSupervisor        — DynamicSupervisor подписок
 │     ├── Stage.PartitionProducer       — GenStage :producer (один на подписку)
 │     └── Stage.Subscriber             — GenStage :consumer (один на подписку)
-├── Cluster.Manager                     — GenServer, consistent hashing ring
+├── Cluster.Manager                     — GenServer, consistent hashing ring + RF
+├── Raft.Supervisor                     — DynamicSupervisor для отдельных Raft-серверов
 ├── Network.Listener                    — TCP accept loop
 └── ConnectionSupervisor                — DynamicSupervisor соединений
       └── Network.Connection            — GenServer на клиента
 ```
 
-## Текущий статус: Фаза 4
+## Текущий статус: Фаза 5
 
 ### Что реализовано
 
@@ -202,6 +203,76 @@ elixir --name broker2@192.168.1.2 -S mix run --no-halt
 
 ---
 
+#### Фаза 5 — Raft: выборы лидера, репликация лога
+
+**Per-partition Raft** (`lib/broker/raft/`)
+
+Каждая партиция теперь — собственная Raft-группа. На N replica-нодах работают `Broker.Raft.Server` процессы под общим именем `:"raft_<topic>_p<partition>"`. Один из них — лидер; PRODUCE проходит через него, реплицируется на quorum, коммитится, применяется на каждой реплике (запись в локальный SegmentManager).
+
+**Алгоритм** (упрощённая реализация Раффта):
+
+- **Роли:** `follower` / `candidate` / `leader`
+- **Election timeout:** случайный 500–1000 мс (избегаем split-vote)
+- **Heartbeat:** AppendEntries каждые 100 мс от лидера
+- **Persistent state (in-memory для phase 5):** `current_term`, `voted_for`, `log`
+- **Volatile state:** `commit_index`, `last_applied`, `leader_node`
+- **Leader state:** `next_index[peer]`, `match_index[peer]`
+
+**RPC** (через `GenServer.cast` поверх Erlang distribution):
+
+| RPC | Назначение |
+|-----|-----------|
+| `:request_vote(from, term, candidate, last_log_index, last_log_term)` | Кандидат собирает голоса |
+| `:request_vote_reply(from, term, granted)` | Ответ голосующего |
+| `:append_entries(from, term, leader, prev_idx, prev_term, entries, leader_commit)` | Репликация + heartbeat |
+| `:append_entries_reply(from, term, success, match_index)` | Подтверждение/отказ от follower |
+
+**Commit-правило:** запись закоммичена, когда индекс реплицирован на majority и термин записи равен текущему термину лидера (Raft safety property из paper).
+
+**Single-node режим:** Когда peers пуст, сервер становится лидером сразу при init (quorum = 1). Это сохраняет backward compatibility — все существующие тесты работают.
+
+**Multi-node режим:**
+- `Cluster.Manager.replicas_for(topic, partition)` возвращает `replication_factor` нод из hash ring.
+- `TopicSupervisor.ensure_partition/2` стартует `PartitionSupervisor` на каждой реплике через `:erpc`.
+- `PartitionSupervisor` добавляет `Raft.Server` рядом с `SegmentManager`. `apply_fn` коммита пишет в локальный SegmentManager.
+- `Connection` при PRODUCE: пробует hash-ring primary; если Raft отвечает `{:not_leader, leader_node}` — ретраит на указанный лидер.
+
+**Поток PRODUCE при replication_factor=3:**
+
+```
+Client → Connection (node1)
+    │
+    ├─ ensure_partition: PartitionSupervisor стартует на [node1, node2, node3]
+    ├─ Partition.append → Raft.Server.propose
+    │     │
+    │     leader (node1)
+    │     ├── append to local log
+    │     ├── broadcast AppendEntries → [node2, node3]
+    │     └── wait for match_index majority (2 of 3)
+    │           ↓
+    │       advance commit_index
+    │           ↓
+    │       apply_fn(entry) на КАЖДОЙ реплике → SegmentManager.append
+    │           ↓
+    │       reply {:ok, offset} клиенту через pending_clients[index]
+```
+
+**Конфигурация:**
+
+```elixir
+# config/config.exs
+config :broker, replication_factor: 3
+config :broker, peers: [:"broker2@host", :"broker3@host"]
+```
+
+**Что не реализовано (отложено):**
+- Персистентность Raft state (`current_term`, `voted_for`, `log` сейчас in-memory; после краша лидер не помнит свой term)
+- Снапшоты и log compaction (лог растёт неограниченно)
+- Dynamic membership changes (joint consensus)
+- Pre-vote / leader stickiness
+
+---
+
 ### Файловая структура
 
 ```
@@ -211,9 +282,14 @@ lib/broker/
 │   ├── frame.ex                — константы типов и кодов ошибок
 │   └── codec.ex                — encode/decode фреймов и payload
 ├── cluster/
-│   ├── hash_ring.ex            — чистые функции: consistent hashing, 150 vnodes
-│   ├── manager.ex              — GenServer: кольцо, nodeup/nodedown
+│   ├── hash_ring.ex            — чистые функции: consistent hashing + replicas_for
+│   ├── manager.ex              — GenServer: кольцо, nodeup/nodedown, RF
 │   └── rpc.ex                  — функции для :erpc.call (produce/fetch)
+├── raft/
+│   ├── log.ex                  — структура лога (in-memory)
+│   ├── server.ex               — Raft state machine: follower/candidate/leader
+│   ├── supervisor.ex           — DynamicSupervisor (для standalone сценариев)
+│   └── rpc.ex                  — :erpc entry points для cross-node propose/fetch
 ├── log/
 │   ├── wal.ex                  — чистые функции: encode/decode/append
 │   ├── segment.ex              — GenServer: один .log + .index файл
@@ -228,9 +304,9 @@ lib/broker/
 │   ├── listener.ex             — TCP accept loop
 │   └── connection.ex           — обработка одного TCP-клиента + routing
 └── topic/
-    ├── partition.ex            — GenServer: делегирует в SegmentManager + notify
-    ├── partition_supervisor.ex — запускает SegmentManager + Compactor + Partition
-    └── topic_supervisor.ex     — DynamicSupervisor
+    ├── partition.ex            — GenServer: append → Raft.propose → notify
+    ├── partition_supervisor.ex — запускает SegmentManager + Compactor + Partition + Raft.Server
+    └── topic_supervisor.ex     — DynamicSupervisor + cross-node ensure
 ```
 
 ### Тесты
@@ -251,7 +327,7 @@ test/
 ```
 
 ```
-mix test                       # 68 тестов, 0 ошибок (4 distributed исключены)
+mix test                       # 73 теста, 0 ошибок (4 distributed исключены)
 mix test --include distributed # + 4 двухнодовых теста (нужен --name)
 ```
 
@@ -347,6 +423,6 @@ IO.puts("offset=#{offset} key=#{key} value=#{value}")
 | 2 | Сегментный лог + индекс, O(log n) lookup | ✅ Готово |
 | 3 | GenStage — backpressure, demand-driven flow | ✅ Готово |
 | 4 | Кластер — consistent hashing, партиции по нодам | ✅ Готово |
-| 5 | Raft — leader election, log replication | ⬜ |
+| 5 | Raft — leader election, log replication | ✅ Готово |
 | 6 | Consumer groups — координатор, rebalance | ⬜ |
 | 7 | Observability — Telemetry, MetricsLib, Benchee | ⬜ |

@@ -45,6 +45,40 @@ defmodule Broker.Cluster.HashRing do
   @spec nodes(t()) :: [node()]
   def nodes(%{nodes: ns}), do: MapSet.to_list(ns)
 
+  # Returns up to `n` distinct replica nodes for the given key.
+  # The first replica is the primary (from node_for/2); the rest are the next
+  # distinct nodes walking the ring clockwise.
+  @spec replicas_for(t(), term(), pos_integer()) :: [node()]
+  def replicas_for(%{nodes: nodes_set} = state, key, n) do
+    all = MapSet.to_list(nodes_set)
+
+    cond do
+      all == [] -> [node()]
+      n >= length(all) -> all
+      true -> walk_unique_nodes(state.ring, key, n)
+    end
+  end
+
+  # Walks the ring from the hash of `key` clockwise, accumulating the first
+  # n distinct nodes encountered (wraps around).
+  defp walk_unique_nodes(ring, key, n) do
+    hash = :erlang.phash2(key, 0x7FFFFFFF)
+    {head, tail} = Enum.split_with(ring, fn {h, _} -> h >= hash end)
+    ordered = head ++ tail
+    do_walk(ordered, n, [], MapSet.new())
+  end
+
+  defp do_walk(_, n, acc, _seen) when length(acc) == n, do: Enum.reverse(acc)
+  defp do_walk([], _n, acc, _seen), do: Enum.reverse(acc)
+
+  defp do_walk([{_, node} | rest], n, acc, seen) do
+    if MapSet.member?(seen, node) do
+      do_walk(rest, n, acc, seen)
+    else
+      do_walk(rest, n, [node | acc], MapSet.put(seen, node))
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
